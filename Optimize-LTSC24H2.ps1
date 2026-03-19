@@ -1,67 +1,73 @@
 #requires -RunAsAdministrator
 <#
-  Optimize-LTSC24H2.ps1
-  Perfil: agresivo pero usable
-  Objetivo: menos procesos, menos RAM usada en segundo plano, menos telemetría y menos carga inútil
-  Probado para Windows 11 LTSC 24H2 / PowerShell 5.1+
+    Optimize-LTSC24H2-SAFE.ps1
+    Windows 11 Enterprise LTSC 24H2 - Safe Profile
 
-  IMPORTANTE:
-  - Reinicia al terminar.
-  - Lee y ajusta los toggles de abajo antes de ejecutarlo.
+    Objetivo:
+    - Bajar ruido de fondo y mejorar respuesta
+    - Evitar cambios agresivos que puedan desestabilizar el sistema
+    - Crear respaldos antes de tocar nada
+    - NO desactivar por defecto:
+        * Windows Search
+        * Hyper-V / WSL / Sandbox
+        * Bluetooth
+        * Print Spooler
+        * Biometrics
+        * Servicios base de red/audio/GPU/Defender/Windows Update
+
+    Recomendación:
+    - Ejecutarlo solo cuando Windows Update no esté instalando nada
+    - Reiniciar al terminar
 #>
 
-# =========================
-# TOGGLES
-# =========================
-$DisableSearchIndexing        = $true   # Desactiva indexado de Windows Search (Start/Search será más simple)
-$DisableSysMain               = $true   # Reduce precarga en RAM y actividad en segundo plano
-$DisableBluetoothServices     = $false  # Ponlo en $true solo si NO usas Bluetooth
-$DisablePrintSpooler          = $false  # Ponlo en $true solo si NO imprimes nunca
-$DisableBiometricService      = $false  # Ponlo en $true si no usas lector biométrico / Windows Hello biométrico
-$DisableLocationServices      = $true
-$DisableErrorReporting        = $true
-$DisableFaxService            = $true
-$DisableXboxServices          = $true
-$DisableRemoteRegistry        = $true
-$DisableVisualEffects         = $true
-$DisableHibernation           = $false  # Si quieres ahorrar espacio y quitar hiberfile.sys => $true
-$SetHighPerformancePlan       = $true   # Modo enchufado = agresivo
-$DisableHyperV_WSL_Sandbox    = $false  # SOLO si no usas Docker / WSL / emuladores / Sandbox / virtualización
-$RunComponentCleanup          = $true
-$KillOneDriveIfRunning        = $true   # Solo mata el proceso; no desinstala
-$DisableEdgeBackgroundMode    = $true
-$DisableBackgroundApps        = $true
-$DisableWidgetsAndSuggestions = $true
-$DisableTelemetryPolicies     = $true
-$DisableFeedbackTasks         = $true
-$ClearTempFiles               = $true
-
-# =========================
-# PREP
-# =========================
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 
-$BaseDir = "C:\LTSC-OPT"
-$LogFile = Join-Path $BaseDir ("optimize-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
-New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
+# =========================
+# TOGGLES SEGUROS
+# =========================
+$CreateRestorePoint            = $true
+$ApplyPrivacyTweaks            = $true
+$ApplyVisualTweaks             = $true
+$ApplyWidgetsSuggestions       = $true
+$ApplyBackgroundAppTweaks      = $true
+$ApplyEdgeTweaks               = $true
+$ApplyGameDVRTweaks            = $true
+$ApplyPowerPlanTuning          = $true
+$ApplyConservativeTaskTweaks   = $true
+$ClearTempFiles                = $true
+
+# Opcionales conservadores (por defecto en false)
+$SetXboxServicesToManual       = $true    # Manual, NO Disabled
+$SetSysMainToManual            = $false   # Mejor dejarlo false por seguridad
+$RestartExplorerAtEnd          = $false   # Mejor reiniciar Windows manualmente
+$RunDismCleanup                = $false   # Lo dejo OFF por seguridad
+
+# =========================
+# PATHS / LOGS
+# =========================
+$BaseDir    = "C:\LTSC-SAFE-OPT"
+$BackupDir  = Join-Path $BaseDir "backup"
+$ReportDir  = Join-Path $BaseDir "reports"
+$LogFile    = Join-Path $BaseDir ("run-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+$Stamp      = Get-Date -Format "yyyyMMdd-HHmmss"
+
+New-Item -ItemType Directory -Path $BaseDir   -Force | Out-Null
+New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
 
 function Write-Log {
     param([string]$Text)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Text
-    $line | Tee-Object -FilePath $LogFile -Append
+    $line | Out-File -FilePath $LogFile -Append -Encoding utf8
+    Write-Host $line
 }
 
-Start-Transcript -Path (Join-Path $BaseDir ("transcript-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")) -Force | Out-Null
-
-Write-Log "=== INICIO OPTIMIZACION LTSC 24H2 ==="
-
-# =========================
-# HELPERS
-# =========================
 function Ensure-RegistryPath {
     param([string]$Path)
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    if (-not (Test-Path $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
 }
 
 function Set-RegValue {
@@ -81,38 +87,33 @@ function Set-RegValue {
     }
 }
 
-function Disable-ServiceSafe {
-    param([string]$Name)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if ($svc) {
-        try {
-            if ($svc.Status -ne 'Stopped') {
-                Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
-            }
-        } catch {}
-        try {
-            Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
-        } catch {
-            cmd /c "sc.exe config `"$Name`" start= disabled" | Out-Null
-        }
-        Write-Log "SERVICE DISABLED -> $Name"
-    } else {
-        Write-Log "SERVICE SKIP (not found) -> $Name"
+function Export-RegSafe {
+    param(
+        [string]$RegistryPath,
+        [string]$OutputFile
+    )
+    try {
+        reg export $RegistryPath $OutputFile /y | Out-Null
+        Write-Log "REG BACKUP OK -> $RegistryPath"
+    } catch {
+        Write-Log "REG BACKUP FAIL -> $RegistryPath"
     }
 }
 
-function Manual-ServiceSafe {
+function Set-ServiceToManualSafe {
     param([string]$Name)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if ($svc) {
-        try {
-            Set-Service -Name $Name -StartupType Manual -ErrorAction Stop
-        } catch {
-            cmd /c "sc.exe config `"$Name`" start= demand" | Out-Null
-        }
+
+    try {
+        $svc = Get-Service -Name $Name -ErrorAction Stop
+        $svc | Select-Object Name, DisplayName, Status, StartType |
+            Export-Csv -Path (Join-Path $BackupDir ("service-$Name-$Stamp.csv")) -NoTypeInformation -Encoding UTF8
+
+        Set-Service -Name $Name -StartupType Manual -ErrorAction Stop
         Write-Log "SERVICE MANUAL -> $Name"
-    } else {
-        Write-Log "SERVICE SKIP (not found) -> $Name"
+
+        # No lo forzamos a parar si está corriendo en este momento
+    } catch {
+        Write-Log "SERVICE SKIP/FAIL -> $Name"
     }
 }
 
@@ -123,21 +124,6 @@ function Disable-TaskSafe {
         Write-Log "TASK DISABLED -> $TaskPath"
     } catch {
         Write-Log "TASK SKIP/FAIL -> $TaskPath"
-    }
-}
-
-function Disable-OptionalFeatureSafe {
-    param([string]$FeatureName)
-    try {
-        $f = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName
-        if ($f -and $f.State -eq 'Enabled') {
-            Disable-WindowsOptionalFeature -Online -FeatureName $FeatureName -NoRestart | Out-Null
-            Write-Log "FEATURE DISABLED -> $FeatureName"
-        } else {
-            Write-Log "FEATURE SKIP -> $FeatureName ($($f.State))"
-        }
-    } catch {
-        Write-Log "FEATURE FAIL/SKIP -> $FeatureName"
     }
 }
 
@@ -154,47 +140,101 @@ function Remove-TempSafe {
     }
 }
 
-function Set-PerformancePlan {
-    Write-Log "Aplicando plan de energia alto rendimiento..."
+function Capture-SystemSnapshot {
+    param([string]$Suffix)
+
     try {
-        cmd /c "powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c" | Out-Null
-        cmd /c "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100" | Out-Null
-        cmd /c "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100" | Out-Null
-        cmd /c "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 5" | Out-Null
-        cmd /c "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 85" | Out-Null
-        cmd /c "powercfg /setactive SCHEME_CURRENT" | Out-Null
-        Write-Log "PLAN DE ENERGIA OK"
+        Get-Process |
+            Sort-Object CPU -Descending |
+            Select-Object -First 40 Name, Id, CPU, WS, PM, Handles, StartTime |
+            Export-Csv -Path (Join-Path $ReportDir ("top-processes-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> top-processes-$Suffix.csv"
     } catch {
-        Write-Log "PLAN DE ENERGIA FAIL"
+        Write-Log "SNAPSHOT FAIL -> processes"
+    }
+
+    try {
+        Get-Service |
+            Sort-Object Status, DisplayName |
+            Select-Object Name, DisplayName, Status, StartType |
+            Export-Csv -Path (Join-Path $ReportDir ("services-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> services-$Suffix.csv"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> services"
+    }
+
+    try {
+        cmd /c "powercfg /getactivescheme" | Out-File -FilePath (Join-Path $ReportDir ("powerplan-$Suffix.txt")) -Encoding utf8
+        Write-Log "SNAPSHOT OK -> powerplan-$Suffix.txt"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> powerplan"
+    }
+
+    try {
+        Get-CimInstance Win32_OperatingSystem |
+            Select-Object CSName, Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize |
+            Export-Csv -Path (Join-Path $ReportDir ("os-$Suffix.csv")) -NoTypeInformation -Encoding UTF8
+        Write-Log "SNAPSHOT OK -> os-$Suffix.csv"
+    } catch {
+        Write-Log "SNAPSHOT FAIL -> os"
+    }
+}
+
+function Set-HighPerformancePlanSafe {
+    try {
+        cmd /c "powercfg /setactive SCHEME_MIN" | Out-Null
+        Write-Log "POWER PLAN -> High Performance (SCHEME_MIN)"
+    } catch {
+        Write-Log "POWER PLAN FAIL"
     }
 }
 
 # =========================
-# RESTORE POINT
+# PRECHECK
 # =========================
+Write-Log "=== SAFE OPTIMIZER START ==="
+
 try {
-    Enable-ComputerRestore -Drive "$($env:SystemDrive)\" | Out-Null
-    Checkpoint-Computer -Description "Antes de optimizar LTSC24H2" -RestorePointType "MODIFY_SETTINGS" | Out-Null
-    Write-Log "Restore point creado"
-} catch {
-    Write-Log "No se pudo crear restore point (continuando)"
+    $os = Get-CimInstance Win32_OperatingSystem
+    Write-Log ("OS -> {0} | Version {1} | Build {2}" -f $os.Caption, $os.Version, $os.BuildNumber)
+} catch {}
+
+# Respaldos clave
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" (Join-Path $BackupDir "HKCU-Explorer-Advanced.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\DWM" (Join-Path $BackupDir "HKCU-DWM.reg")
+Export-RegSafe "HKCU\Software\Microsoft\InputPersonalization" (Join-Path $BackupDir "HKCU-InputPersonalization.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" (Join-Path $BackupDir "HKCU-AdvertisingInfo.reg")
+Export-RegSafe "HKCU\System\GameConfigStore" (Join-Path $BackupDir "HKCU-GameConfigStore.reg")
+Export-RegSafe "HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR" (Join-Path $BackupDir "HKCU-GameDVR.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" (Join-Path $BackupDir "HKLM-CloudContent.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" (Join-Path $BackupDir "HKLM-AppPrivacy.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" (Join-Path $BackupDir "HKLM-System.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Edge" (Join-Path $BackupDir "HKLM-Edge.reg")
+Export-RegSafe "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" (Join-Path $BackupDir "HKLM-GameDVR.reg")
+
+Capture-SystemSnapshot -Suffix "before"
+
+# Punto de restauración
+if ($CreateRestorePoint) {
+    try {
+        Enable-ComputerRestore -Drive "$($env:SystemDrive)\" | Out-Null
+        Checkpoint-Computer -Description "Before LTSC Safe Optimizer" -RestorePointType "MODIFY_SETTINGS" | Out-Null
+        Write-Log "RESTORE POINT -> created"
+    } catch {
+        Write-Log "RESTORE POINT -> skipped/fail"
+    }
 }
 
 # =========================
-# 1) POLITICAS / TELEMETRIA
+# PRIVACY / USER EXPERIENCE
 # =========================
-if ($DisableTelemetryPolicies) {
-    Write-Log "Aplicando politicas de privacidad y telemetria..."
+if ($ApplyPrivacyTweaks) {
+    Write-Log "Applying privacy tweaks..."
 
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" "DWord" 0
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "MaxTelemetryAllowed" "DWord" 0
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" "DWord" 1
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" "DWord" 2
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\AdvertisingInfo" "DisabledByGroupPolicy" "DWord" 1
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" "DWord" 0
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "PublishUserActivities" "DWord" 0
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" "DWord" 0
-    Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff" "DWord" 1
 
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" "DWord" 1
@@ -202,34 +242,44 @@ if ($DisableTelemetryPolicies) {
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" "DWord" 0
 }
 
-if ($DisableWidgetsAndSuggestions) {
-    Write-Log "Desactivando sugerencias, widgets y ruido visual..."
+if ($ApplyWidgetsSuggestions) {
+    Write-Log "Applying widgets and suggestions tweaks..."
+
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" "DWord" 0
+
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SystemPaneSuggestionsEnabled" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338388Enabled" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353694Enabled" "DWord" 0
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353696Enabled" "DWord" 0
-    Set-RegValue "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" "DWord" 1
 }
 
-if ($DisableBackgroundApps) {
-    Write-Log "Desactivando background apps..."
+if ($ApplyBackgroundAppTweaks) {
+    Write-Log "Applying background apps tweaks..."
+
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" "DWord" 2
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" "DWord" 1
 }
 
-if ($DisableEdgeBackgroundMode) {
-    Write-Log "Desactivando background mode de Edge..."
+if ($ApplyEdgeTweaks) {
+    Write-Log "Applying Edge background tweaks..."
+
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "BackgroundModeEnabled" "DWord" 0
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "StartupBoostEnabled" "DWord" 0
 }
 
-# =========================
-# 2) VISUAL / UX
-# =========================
-if ($DisableVisualEffects) {
-    Write-Log "Aplicando modo visual ligero..."
+if ($ApplyGameDVRTweaks) {
+    Write-Log "Applying Game DVR tweaks..."
+
+    Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" "DWord" 0
+    Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" "DWord" 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" "DWord" 0
+}
+
+if ($ApplyVisualTweaks) {
+    Write-Log "Applying visual tweaks..."
+
     Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" "DWord" 2
     Set-RegValue "HKCU:\Control Panel\Desktop" "MenuShowDelay" "String" "0"
     Set-RegValue "HKCU:\Control Panel\Desktop\WindowMetrics" "MinAnimate" "String" "0"
@@ -238,63 +288,32 @@ if ($DisableVisualEffects) {
 }
 
 # =========================
-# 3) GAME DVR / XBOX
+# SERVICES (CONSERVATIVE)
 # =========================
-Write-Log "Desactivando Game DVR..."
-Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" "DWord" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" "DWord" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" "DWord" 0
-
-# =========================
-# 4) SERVICIOS
-# =========================
-Write-Log "Ajustando servicios..."
-
-Disable-ServiceSafe "DiagTrack"          # Telemetry
-Disable-ServiceSafe "MapsBroker"         # Maps broker
-Disable-ServiceSafe "RetailDemo"         # Retail demo
-Disable-ServiceSafe "PhoneSvc"           # Phone service
-
-if ($DisableLocationServices)  { Disable-ServiceSafe "lfsvc" }
-if ($DisableErrorReporting)    { Disable-ServiceSafe "WerSvc" }
-if ($DisableFaxService)        { Disable-ServiceSafe "Fax" }
-if ($DisableRemoteRegistry)    { Disable-ServiceSafe "RemoteRegistry" }
-if ($DisableSysMain)           { Disable-ServiceSafe "SysMain" }
-if ($DisableSearchIndexing)    { Disable-ServiceSafe "WSearch" }
-if ($DisableXboxServices)      {
-    Disable-ServiceSafe "XblAuthManager"
-    Disable-ServiceSafe "XblGameSave"
-    Disable-ServiceSafe "XboxNetApiSvc"
+if ($SetXboxServicesToManual) {
+    Write-Log "Setting Xbox services to Manual..."
+    Set-ServiceToManualSafe "XblAuthManager"
+    Set-ServiceToManualSafe "XblGameSave"
+    Set-ServiceToManualSafe "XboxNetApiSvc"
 }
-if ($DisableBluetoothServices) {
-    Disable-ServiceSafe "bthserv"
-    Disable-ServiceSafe "BthAvctpSvc"
+
+if ($SetSysMainToManual) {
+    Write-Log "Setting SysMain to Manual..."
+    Set-ServiceToManualSafe "SysMain"
 }
-if ($DisablePrintSpooler)      { Disable-ServiceSafe "Spooler" }
-if ($DisableBiometricService)  { Disable-ServiceSafe "WbioSrvc" }
-
-# Servicios que prefiero dejar en manual, no matar completamente
-Manual-ServiceSafe "dmwappushservice"
 
 # =========================
-# 5) TAREAS PROGRAMADAS
+# TASKS (CONSERVATIVE)
 # =========================
-if ($DisableFeedbackTasks) {
-    Write-Log "Desactivando tareas programadas ruidosas..."
+if ($ApplyConservativeTaskTweaks) {
+    Write-Log "Applying conservative scheduled-task tweaks..."
 
     $Tasks = @(
-        "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
-        "\Microsoft\Windows\Application Experience\PcaPatchDbTask",
-        "\Microsoft\Windows\Application Experience\ProgramDataUpdater",
-        "\Microsoft\Windows\Autochk\Proxy",
         "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
         "\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask",
         "\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
-        "\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
         "\Microsoft\Windows\Feedback\Siuf\DmClient",
-        "\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
-        "\Microsoft\Windows\Maps\MapsToastTask",
-        "\Microsoft\Windows\Maps\MapsUpdateTask"
+        "\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload"
     )
 
     foreach ($task in $Tasks) {
@@ -303,70 +322,45 @@ if ($DisableFeedbackTasks) {
 }
 
 # =========================
-# 6) CARACTERISTICAS OPCIONALES
+# POWER
 # =========================
-if ($DisableHyperV_WSL_Sandbox) {
-    Write-Log "Desactivando Hyper-V / WSL / Sandbox..."
-    $Features = @(
-        "Microsoft-Hyper-V-All",
-        "VirtualMachinePlatform",
-        "HypervisorPlatform",
-        "Containers-DisposableClientVM",
-        "Microsoft-Windows-Subsystem-Linux",
-        "Windows-Defender-ApplicationGuard"
-    )
-
-    foreach ($feature in $Features) {
-        Disable-OptionalFeatureSafe $feature
-    }
-
-    Disable-ServiceSafe "vmcompute"
-    Disable-ServiceSafe "HvHost"
-    Disable-ServiceSafe "hns"
+if ($ApplyPowerPlanTuning) {
+    Write-Log "Applying power plan..."
+    Set-HighPerformancePlanSafe
 }
 
 # =========================
-# 7) ENERGIA
+# CLEANUP
 # =========================
-if ($SetHighPerformancePlan) {
-    Set-PerformancePlan
-}
-
-if ($DisableHibernation) {
-    Write-Log "Desactivando hibernacion..."
-    cmd /c "powercfg /h off" | Out-Null
-}
-
-# =========================
-# 8) PROCESOS Y LIMPIEZA
-# =========================
-if ($KillOneDriveIfRunning) {
-    Write-Log "Cerrando OneDrive si esta abierto..."
-    Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
 if ($ClearTempFiles) {
-    Write-Log "Limpiando temporales..."
+    Write-Log "Cleaning temp files..."
     Remove-TempSafe $env:TEMP
-    Remove-TempSafe "$env:WINDIR\Temp"
     Remove-TempSafe "$env:LOCALAPPDATA\Temp"
+    Remove-TempSafe "$env:WINDIR\Temp"
 }
 
-if ($RunComponentCleanup) {
-    Write-Log "Ejecutando limpieza de componentes..."
+if ($RunDismCleanup) {
+    Write-Log "Running DISM cleanup..."
     Start-Process -FilePath "dism.exe" -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup" -Wait -NoNewWindow
 }
 
 # =========================
-# 9) REINICIO DE EXPLORER
+# FINAL SNAPSHOT
 # =========================
-Write-Log "Reiniciando Explorer..."
-Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Process explorer.exe
+Capture-SystemSnapshot -Suffix "after"
 
-Write-Log "=== OPTIMIZACION FINALIZADA ==="
-Stop-Transcript | Out-Null
+if ($RestartExplorerAtEnd) {
+    try {
+        Write-Log "Restarting Explorer..."
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Process explorer.exe
+    } catch {
+        Write-Log "Explorer restart skipped/fail"
+    }
+}
 
+Write-Log "=== SAFE OPTIMIZER END ==="
 Write-Host ""
-Write-Host "Listo. Reinicia la PC para aplicar todo al 100%." -ForegroundColor Green
-Write-Host "Log: $LogFile" -ForegroundColor Cyan
+Write-Host "Listo. Reinicia Windows para aplicar los cambios de forma limpia." -ForegroundColor Green
+Write-Host "Logs y respaldos en: $BaseDir" -ForegroundColor Cyan
+Write-Host "Si algo raro pasa, revisa primero: $ReportDir" -ForegroundColor Yellow
